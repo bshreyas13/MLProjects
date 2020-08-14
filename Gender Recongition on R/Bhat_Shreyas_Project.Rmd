@@ -1,0 +1,998 @@
+---
+title: "Gender Recognition From Vocal Frequency Characteristics"
+author: "Shreyas Bhat"
+date: "8/7/2020"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+# List of Libraries used #
+
+library(tidyverse)
+library(corrplot)
+library(caret)
+library(gridExtra)
+library(cowplot)
+library(grid)
+library(MASS)
+library(rpart)
+library(gbm)
+library(e1071)
+library(warbleR)
+library(tuneR)
+
+#Setup and plot theme#
+knitr::opts_chunk$set(echo = TRUE)
+vto <- "#CF4420"
+vtlo <- "#ff9948"
+vtm <- "#630031"
+vt.theme <- theme_grey() +
+  theme(text = element_text(color = vtm),
+        axis.line = element_line(color = vtm),
+        panel.background = element_rect(fill = vtlo, color = vto),
+        axis.title = element_text(size = 10, face = "bold"),
+        plot.title = element_text(face = "bold",hjust=0.5))
+```
+
+##1. Introduction
+
+Gender recognition from voice, a seemingly straightforward task for the human brain but can be quite a challenge for a computer. The human brain is able to identify the gender of a speaker on hearing a voice almost subconsciously. However, enabling a computer to perform this task becomes quite tricky. For starters, it needs a microphone to record the voice as a acoustic signal, then comes the interpretation of said signal. We will briefly discuss the initially steps of  interpretation in the following sections. This project however, tackles the next step of the problem namely, classifying pre-processed voice samples, originally .wav files, as male or female.
+
+#1.1 Understanding acoustic signals
+
+In this era of digital signals , an acoustic signal or audio signal can be analyzed very intricately by studying the frequencies contained within the signal. We can start with the knowledge that, while the human ear has a audible frequency range of 20Hz-20KHz, the human vocal range broadly lies between 20Hz- 280Hz. Therefore, from any given audio sample we only have to analyze the characteristics of this small range of frequencies to classify it by gender.
+
+#1.2 The Questions
+
+In the crudest sense we can see that male voice has a lower pitch that female voice. This difference in pitch is essentially due to the different range of frequencies. However, consider cases where the vocal range of an individual is in more androgynous range, or varied intonation in the samples etc, in realtime samples there are many such cases which cannot be simply classified using the frequency range. When we talk about a robust classifying criteria a few important questions present themselves;
+1) What are the frequency characteristics that differ between genders?
+2) Is there a difference in resonance between genders?
+3) What features drive the classification and are thereby efficient predictors of the gender?
+
+In this project we delve into these questions and compare the various classification techniques.We will evaluate each of the model by using 'misclassification error rate' as the metric as we dont particularly care about false positives or false negatives.
+
+##2. Dataset
+
+The dataset we are using here has 3,168 voice sample that are labled as male and female. The original audio (.wav) files have been compiled from various databases and pre-processed using the Specan function in WarbleR R package.The link to original voice samples is attached in the Appendix.
+The specan function measures 22 frequency parameters on acoustic signals. These 22 parameters and observed values have been compiled into a .csv file. Out of these 22 parameters 2 corresponding to duration and peak frequency are omitted in the dataset as the duration has been set to 20 secs for all samples and peak frequency generates as set of 0's in this case. Therefore including the label we have a dataset that is a 3168 x 21 tibble.
+
+This dataset was originally uploaded on primaryobjects.com a website run by Kory Becker, who is a software developer and has worked on developing AI for popular products such as ALEXA and Google Assistant. She later uploaded the same to kaggle as part of a competition. It can be downloaded here, https://www.kaggle.com/primaryobjects/voicegender.
+
+The dataset has been imported and the list of properties used for the exercise can be seen below.
+It is possible to record a sample wave file run it through the specan tool to classify our own samples as well. 
+
+```{r echo=FALSE}
+#Import Datset
+path <- paste0(getwd(), "/voice.csv")
+voice.df<- read_csv(path)
+colnames(voice.df)
+```
+The features corresponding the displayed columns are explained in the Appendix.
+
+#2.1 Split into train and test sets
+
+The dataset has samples labeled with one of classes, male and female in the .csv file. We check for na values and omit them, then check if the samples are ordered by listing all the indices of the samples where the label changes.  
+```{r echo=FALSE}
+#Remove samples with NA values
+voice.df <- na.omit(voice.df)
+t.n=nrow(voice.df) # total number of rows
+#check for change in label and list the indices 
+count =0
+fs = voice.df$label[1] #first sample
+for (k in 1:nrow(voice.df)){
+  if (voice.df$label[k] != fs){
+    idx = bind_rows(c(index=k,total_rows = t.n))
+    break
+  }
+}
+idx
+```
+As we can see the only change in label is seen halfway through the our dataset of 3168 rows. This confirms there are no values missing and  the data is ordered. Hence, we first shuffle the data and then set aside train and test data with a 80%-20% split respectively.
+
+```{r echo=FALSE}
+# set seed so that the results can be duplicated
+set.seed(77) 
+#Shuffling datset as on observing the .csv file we can see that the male and female samples are ordered
+shuffle <- sample(1:nrow(voice.df), size = nrow(voice.df), replace = F)
+voice.df <- voice.df[shuffle, ]
+# select a 20% sample of the indices of the rows in the dataset
+test.indices <- sample(1:nrow(voice.df), 0.2 * nrow(voice.df))
+# set aside the test and train data
+test.voice <- voice.df[test.indices, ]
+train.voice <- voice.df[-test.indices, ]
+```
+
+##3. Preliminary Analysis
+
+#3.1 Feature comparison
+
+Now that we have split the data into train and test sets, we dig a little further into the features.
+We can view the dataframe to get a better understanding of the nature of values associated with each feature.  
+```{r echo=FALSE}
+#train.voice #Not printing on report 
+```
+However, to efficiently compare the range of values of the features we plot them as shown below in the "Features as Measured" plot.
+```{r echo=FALSE}
+# Plot comparing all features 
+train.voice %>%
+  pivot_longer(meanfreq:modindx, names_to = "feature", values_to = "frequency") %>%
+  ggplot() + vt.theme +theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))+
+  geom_boxplot(aes(x = feature, y = frequency))+ggtitle("Features as Measured")
+
+```
+From the boxplot we can see that the kurtosis is very skewed , therefore we take log of the parameter and re-plot the features. 
+```{r echo=FALSE}
+#Transform kurtosis
+train.voice <- train.voice %>%
+ mutate(kurt = log(kurt))
+# Plot all features
+train.voice %>%
+  pivot_longer(meanfreq:modindx, names_to = "feature", values_to = "frequency") %>%
+  ggplot() + vt.theme +theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))+
+  geom_boxplot(aes(x = feature, y = frequency))+ggtitle("Features After Natural log")
+
+```
+As we can see in "Features After Natural Log" after taking log of the kurtosis the features are more comparable. Now we can explore the features further.
+
+#3.2 Correlation and Feature Selection
+
+To explore which features make better predictors, we can start by analyzing the correlation between features and removing redundant features. This is effective as highly correlated features can be expressed as a
+
+We first transform the label as male =0 and female = 1 for easier calculations and store is a separate dataframe.
+
+```{r echo=FALSE}
+#Find and plot correlation matrix
+#Recode labels as male =0 Female =1
+train.voice.nl <- train.voice %>%
+  mutate(label = recode(label, 
+                      "male" = 0, 
+                      "female" = 1))
+
+corr.mat = cor(train.voice.nl)
+corrplot(corr.mat, method="square" ,mar=c(0,0,4,0),tl.col="#ff9948",main="Correlation between Features with Gender label") 
+```
+ The  Heatmap "Correlation between features" shows How independent each feature is from the other. The correlation with the column "label" indicates how much each feature drives the classification.
+From this we can also see there is strong correlation between several features as indicated by the dark blues(positive correlation) and and dark reds(negative correlation). This indicates that we can reduce number of features used as predictors to build a robust model.
+
+We can furtherexplore the features and analyze their viability as predictors from the heatmap/correlation matrix.
+```{r}
+#Extract feature with highest correlation with label
+which.max(corr.mat[-nrow(corr.mat),ncol(corr.mat)])
+```
+First, we start by looking at the correlation between label and features. In this case "meanfun" or " Mean fundamental Frequency" is found to have highest positive correlation with the "label(Gender)". Additionally, "meanfun" also has relatively low correlation with other features.THis indicates it is a good predictor.
+
+```{r echo=FALSE}
+#Plot meanfun vs Gender(label)
+train.voice %>% 
+  ggplot() + vt.theme +
+  geom_boxplot(aes(x = label,y=meanfun))+
+  xlab("Gedner")+ylab("Mean Fundamental Frequency") + ggtitle("Mean Fundamental Frequency Vs Gender")
+```
+The boxplot of "Mean Fundamental Frequency Vs Gender" clearly shows that Gender is largely separable by the feature "meanfun". This also indicates that it is a strong predictor.
+
+In the next set of plots we visualize the effects of correlation between the features on classification. We choose 3 pairs of features with coefficients ranging between strong positive to strong negative correlation
+
+```{r echo=FALSE}
+#Plot features pairwise to visualize the effects of correlation 
+plot1<- train.voice %>% 
+  ggplot() + vt.theme +
+  geom_point(aes(x = meanfun, y = modindx, color = label))+
+  xlab("Mean Fundamental Frequency")+ylab("Modulation Index") + ggtitle("Features with near-zero correlation")+
+  theme(plot.title = element_text(face = "bold",hjust=0.2))
+
+plot2<-train.voice %>% 
+  ggplot() + vt.theme +
+  geom_point(aes(x = dfrange, y = maxdom, color = label)) +
+  xlab("Max dominant Frequency")+ylab("Modulation Index") + ggtitle("Features with strong postive correlation")+
+  theme(plot.title = element_text(face = "bold",hjust=0))
+
+
+plot3<-train.voice %>% 
+  ggplot() + vt.theme +
+  geom_point(aes(x = meanfreq, y = sfm, color = label))+
+  xlab("Mean Frequency")+ylab("Spectral Flatness") + ggtitle("Features with strong negative correlation")+
+  theme(plot.title = element_text(face = "bold",hjust=0.2))
+
+plot_grid(plot1,plot2,plot3, nrow=2,ncol=2 , align ="hv")
+
+
+```
+From the plots we can see that features with near 0 correlation coefficient make better predictors when used together as the data has less overlap and is easily separable. Evidently, we can find features that are unique which  can effectively separate the classes by evaluating the absolute correlation.
+Therefore we can perform effective feature selection by eliminating the features with high absolute correlation.
+
+First, we remove the 'label' column and recalculate the correlation matrix as we only want to eliminate collinear features wihtout affecting features with correlation to the label. This gives us a correlation matrix of features from which we can identify the ones with absolute correlation greater than a set cut off value. 
+
+```{r echo=FALSE}
+#Feature Seclection
+# obtain correlation matrix without label
+corr.mat.features = cor(train.voice[-21])
+
+#Check for features with absolute correlation > 0.7 to reduce number of redundant features
+highly.Correlated <- findCorrelation(corr.mat.features, cutoff=0.7)
+
+# Identifying Variable Names of Highly Correlated Variables
+highly.Cor.Col <- colnames(train.voice.nl)[highly.Correlated]
+
+# Print highly correlated attributes
+#highly.Cor.Col
+
+#Remove the identified columns and create a reduced dataframe with the chosen predictors
+train.voice.red=train.voice.nl[, - which(colnames(train.voice.nl) %in% highly.Cor.Col)]
+colnames(train.voice.red)
+```
+We can select a cutoff for absolute correlation coefficient based on how strictly we want to eliminate features. The standard practice is to use a value in the range "0.7 or higher". From the result shown above we know that 11 features are selected by this method of feature selction. We can now test the performances of classification models with these predictors. 
+We will also be using metrics and details obtained with each model to bolster our understanding of the predictors.
+
+##4. Modeling
+
+There are number of classification techniques that can be used for the task. However, we limit the scope of this project to a comparison of logistic Regression, LDA, Decision Tree, Boosted model and SVM. 
+Before we fit, tune and test models we consider a simple baseline model. This model is the simplest way of performing the gender classification and serves as a reference to  highlight the improvement obtained due to each step of analysis. 
+
+#4.1 Baseline
+
+First, let us take a step back and consider that  we don't perform the preliminary analysis.
+In this case, it seems that we can chose "mean frequency" as a predictor since it is the mean of the frequencies in the vocal range, thereby, an obvious descriptor of the High and low pitched natures of the female and male vocal ranges . We therefore , have fit a simple Baseline model is fit using Logistic regression with 'Mean Frequency" as the predictor. 
+
+```{r echo=FALSE}
+baseline.fit.voice <- glm(label ~meanfreq, family = "binomial", data = train.voice.nl)
+summary(baseline.fit.voice)$aic
+```
+We can extract the AIC or Akaike information criterion (AIC), an estimator of out-of-sample prediction error, from the model summary.The high AIC observed indicates that the model is very inaccurate. We now check the training error rate for the fit.
+```{r echo=FALSE}
+#Train Error 
+obs.response <- train.voice.nl$label
+voice.pred <- rep("0", nrow(train.voice))
+voice.pred[baseline.fit.voice$fitted.values > 0.5] <- "1"
+Con_Mat=table(voice.pred, obs.response)
+#Con_Mat
+
+
+FP = Con_Mat[2,1]
+TN = Con_Mat[1,1]
+FPR = FP/(FP+TN)
+
+error.train=mean(voice.pred != obs.response)*100
+error.train
+
+```
+We can see that also the overall training error rate for this baseline model is 36.2%.
+
+##4.2 Logistic Regression 
+#4.2.1 Improved Single predictor logit model
+
+Now, let us consider the observations made in Section 3. We can fit another single predictor model with "Mean fundamental frequency" as the predictor instead of "Mean Frequency".As seen from the preliminary analysis in section 3.2 'meanfun" is a powerful predictor. We now check how that reflects on a logit fit. 
+
+```{r echo=FALSE}
+imp.sf.fit <- glm(label ~meanfun, family = "binomial", data = train.voice.nl)
+summary(imp.sf.fit)$aic
+```
+From the much lower AIC of 737.7 indicates that logistic model is better that the baseline model.We now check the training error rate for the fit.
+```{r echo=FALSE}
+#Train Error 
+obs.response <- train.voice.nl$label
+voice.pred <- rep("0", nrow(train.voice))
+voice.pred[imp.sf.fit$fitted.values > 0.5] <- "1"
+Con_Mat=table(voice.pred, obs.response)
+#Con_Mat
+
+FP = Con_Mat[2,1]
+TN = Con_Mat[1,1]
+FPR = FP/(FP+TN)
+
+error.train=mean(voice.pred != obs.response)*100
+error.train
+```
+The overall train error rate of 4.3% is a big step forward from the baseline as indicated from the AIC.This clearly shows the importance of feature selection when fitting a classification models. And In this case also indicated that mean frequency has a significantly large influence on the classification. 
+
+#4.2.2 Multi-predictor logit model
+
+Now, that we have illustrated that the feature selection is effective, we fit a model with the reduced 4 predictors obtained form section 3, namely, "Q75", "IQR", "skew", "sp.ent", "mode", "meanfun", "minfun", "maxfun", "meandom", "mindom", "modindx".
+
+```{r echo=FALSE}
+# To make the fitting easier I an used the reduced dataframe with only the required predictors 
+best.logit.fit <- glm(label ~., family = "binomial", data = train.voice.red)
+summary(best.logit.fit)$aic
+```
+The AIC=510.1  indicates that this multi-predictor logistic model will perform better than the single predictor model. We now check the training error rate for the fit.
+```{r echo=FALSE}
+#Train Error
+obs.response <- train.voice.nl$label
+voice.pred <- rep("0", nrow(train.voice.nl))
+voice.pred[best.logit.fit$fitted.values > 0.5] <- "1"
+Con_Mat=table(voice.pred, obs.response)
+#Con_Mat
+
+
+FP = Con_Mat[2,1]
+TN = Con_Mat[1,1]
+FPR = FP/(FP+TN)
+
+error.train=mean(voice.pred != obs.response)*100
+error.train
+```
+The overall train error rate of 2.5% is obtained . This reinforces the observation from the AIC that this is a better classifier than single predictor model.Therefore, by all indications the features selected make good predictors.We will continue testing different models with these predictors.
+
+```{r echo=FALSE}
+#K-Fold Validator for logit # Chunk used in section 4.8
+logit.k.fold.validator <- function(df, K, tol,fit.formula) {
+  
+  # this function calculates the errors of a single fold using the fold as the holdout data
+  fold.errors <- function(df, holdout.indices) {
+    train.data <- df[-holdout.indices, ]
+    holdout.data <- df[holdout.indices, ]
+    
+    train.fit <- glm(formula=fit.formula,family ="binomial", data = train.data)
+    
+    obs.response <- train.data$label
+    voice.pred <- rep("0", nrow(train.data))
+    voice.pred[train.fit$fitted.values > tol] <- "1"
+    
+    train.error <- mean(obs.response != voice.pred)
+    
+    obs.holdout <- holdout.data$label
+    voice.holdout = predict(train.fit, newdata=holdout.data, type='response')
+    voice.holdout = ifelse(voice.holdout > 0.5, "1","0") 
+    
+    
+    holdout.error <- mean(obs.holdout != voice.holdout)
+    
+    tibble(train.error = train.error, valid.error = holdout.error)
+  }
+  
+  # shuffle the data and create the folds
+  indices <- sample(1:nrow(df))
+  # if argument K == 1 we want to do LOOCV
+  if (K == 1) {
+    K <- nrow(df)
+  }
+  folds <- cut(indices, breaks = K, labels = F)
+  # set error to 0 to begin accumulation of fold error rates
+  errors <- tibble()
+  # iterate on the number of folds
+  for (i in 1:K) {
+    holdout.indices <- which(folds == i, arr.ind = T)
+    folded.errors <- fold.errors(df, holdout.indices)
+    errors <- errors %>%
+      bind_rows(folded.errors)
+  }
+  errors %>%
+    summarize(train.errors.logit=mean(train.error), valid.errors.logit=mean(valid.error))
+}
+```
+
+```{r echo=FALSE}
+formula.baseline= (label ~meanfreq)
+formula.sf= (label ~meanfun)
+formula.mf = (label~.)
+
+set.seed(77)
+tol = 0.5
+numiters =100
+iterated.errors.sf <- tibble()
+iterated.errors.mf <- tibble()
+iterated.errors.baseline<- tibble()
+
+for (i in  1:numiters){
+  i=i+1
+  fold.errors.sf <- logit.k.fold.validator(train.voice.nl, 5, tol=tol, formula.sf)
+  iterated.errors.sf <- iterated.errors.sf %>%
+    bind_rows(fold.errors.sf)
+  fold.errors.mf <- logit.k.fold.validator(train.voice.red, 5, tol=tol, formula.mf)
+  iterated.errors.mf <- iterated.errors.mf %>%
+    bind_rows(fold.errors.mf)
+  fold.errors.baseline <- logit.k.fold.validator(train.voice.nl, 5, tol=tol, formula.baseline)
+  iterated.errors.baseline <- iterated.errors.baseline %>%
+    bind_rows(fold.errors.baseline)
+  
+}
+colnames(iterated.errors.mf) <- c("train.logit.mp","valid.logit.mp")
+colnames(iterated.errors.sf) <- c("train.logit.sp","valid.logit.sp")
+colnames(iterated.errors.baseline) <- c("train.baseline","valid.baseline")
+```
+
+
+
+#4.3 Linear Discriminant Analysis
+
+First off, we fit a Linear Discriminant Analysis Classifier.
+```{r echo=FALSE}
+lda.formula <- formula(label~.)
+voice.lda<- lda(lda.formula, train.voice.red)
+voice.lda
+```
+The summary of the LDA fit is as shown here. Here we can see that the linear discriminant(LD1) corresponding to "Mean Fundamental Frequency" has a very high positive coefficient indicating that higher mean fundamental frequency pushes the sample into the class label '1' or 'Female'. This is consistent with what we observed in the plot "Gender Vs Mean Fundamental Frequency". Similarly, "Inter-quantile Range' or 'IQR' has a high negative coefficient indicating that higher IQR pushes the sample towards "0" of "male" label. 
+```{r echo=FALSE}
+#Train Error
+tol = 0.5
+lda.prob <- predict(voice.lda, train.voice.red)
+lda.pred1 <- lda.prob$posterior[,2]
+
+
+gend.pred <- rep(0, nrow(train.voice.red))
+gend.pred[lda.pred1 > tol] <- 1
+obs.response = train.voice.red$label
+
+Con_Mat=table(gend.pred, obs.response)
+#Con_Mat
+
+FP = Con_Mat[2,1]
+TN = Con_Mat[1,1]
+FPR = FP/(FP+TN) 
+
+error = mean(gend.pred != obs.response)*100
+error
+```
+LDA gives a training error of 2.8% which is slightly higher than corresponding logistic model.  
+
+```{r echo=FALSE}
+#K-Fold Validator for lda # Chunk used in section 4.8
+lda.k.fold.validator <- function(df, K, tol,fit.formula) {
+  
+  # this function calculates the errors of a single fold using the fold as the holdout data
+  fold.errors <- function(df, holdout.indices) {
+    train.data <- df[-holdout.indices, ]
+    holdout.data <- df[holdout.indices, ]
+    
+    fit <- lda(fit.formula, train.data)
+    
+    obs.response <- train.data$label
+    train.prob <- predict(fit, train.data)
+    voice.pred <- rep("0", nrow(train.data))
+    voice.pred[train.prob$posterior[,2] > tol] <- "1"
+    
+    train.error <- mean(obs.response != voice.pred)
+    
+    obs.holdout <- holdout.data$label
+    holdout.prob <- predict(fit, holdout.data)
+    voice.holdout <- rep("0", nrow(train.data))
+    voice.holdout[holdout.prob$posterior[,2] > tol] <- "1"
+    
+    holdout.error <- mean(obs.holdout != voice.holdout)
+    
+    tibble(train.error = train.error, valid.error = holdout.error)
+  }
+  
+  # shuffle the data and create the folds
+  indices <- sample(1:nrow(df))
+  # if argument K == 1 we want to do LOOCV
+  if (K == 1) {
+    K <- nrow(df)
+  }
+  folds <- cut(indices, breaks = K, labels = F)
+  # set error to 0 to begin accumulation of fold error rates
+  errors <- tibble()
+  # iterate on the number of folds
+  for (i in 1:K) {
+    holdout.indices <- which(folds == i, arr.ind = T)
+    folded.errors <- fold.errors(df, holdout.indices)
+    errors <- errors %>%
+      bind_rows(folded.errors)
+  }
+  errors %>%
+    summarize(train.errors.logit=mean(train.error), valid.errors.logit=mean(valid.error))
+}
+```
+
+```{r echo=FALSE}
+
+formula.lda = (label~.)
+
+set.seed(77)
+iterated.errors.lda <- tibble()
+
+for (i in  1:numiters){
+  i=i+1
+  fold.errors.lda <- lda.k.fold.validator(train.voice.red, 5, tol=tol, formula.lda)
+  iterated.errors.lda <- iterated.errors.lda %>%
+    bind_rows(fold.errors.lda)
+  
+}
+
+colnames(iterated.errors.lda) <- c("train.lda","valid.lda")
+```
+
+
+#4.4 Decision Tree
+
+Next, we fit a Decision Tree based model. Here we use th rpart package to test and fit a classification and Regression Tree. It selects the best predictors that can separate the dataset into the classes. 
+```{r echo=FALSE}
+
+train.voice.tree <- train.voice[, - which(colnames(train.voice.nl) %in% highly.Cor.Col)]
+
+voice.tree <- rpart(label ~.,data=train.voice.tree)
+par(mai=c(0.3,0.3,0.3,0.3))
+plot(voice.tree,main="CART Model")
+text(voice.tree)
+
+```
+From the plot of the Tree Model we can see that it identifies the Mean Fundamental Frequency of 140Hz as the separator between the classes.We now check the training error rate for the fit.
+```{r echo=FALSE}
+#Train Error 
+
+obs.response <- train.voice.tree$label
+voice.pred = predict(voice.tree,train.voice.tree,type="class")
+
+Con_Mat=table(voice.pred, obs.response)
+#Con_Mat
+
+FP = Con_Mat[2,1]
+TN = Con_Mat[1,1]
+FPR = FP/(FP+TN)
+
+error.train=mean(voice.pred != obs.response)*100
+error.train
+
+```
+The CART model gives a train error rate of 3.1% which is slightly higher than the multiple predictor logistic model.
+```{r echo=FALSE}
+#K-Fold Validator for Decision Tree # Chunk used in section 4.8
+tree.k.fold.validator <- function(df, K,fit.formula) {
+  
+  # this function calculates the errors of a single fold using the fold as the holdout data
+  fold.errors <- function(df, holdout.indices) {
+    train.data <- df[-holdout.indices, ]
+    holdout.data <- df[holdout.indices, ]
+    
+    fit <- rpart(fit.formula,train.data)
+    
+    obs.response <- train.data$label
+    voice.pred <- predict(fit, train.data,type="class")
+    
+    train.error <- mean(obs.response != voice.pred)
+    
+    obs.holdout <- holdout.data$label
+    voice.holdout <- predict(fit, holdout.data,type="class")
+    
+    holdout.error <- mean(obs.holdout != voice.holdout)
+    
+    tibble(train.error = train.error, valid.error = holdout.error)
+  }
+  
+  # shuffle the data and create the folds
+  indices <- sample(1:nrow(df))
+  # if argument K == 1 we want to do LOOCV
+  if (K == 1) {
+    K <- nrow(df)
+  }
+  folds <- cut(indices, breaks = K, labels = F)
+  # set error to 0 to begin accumulation of fold error rates
+  errors <- tibble()
+  # iterate on the number of folds
+  for (i in 1:K) {
+    holdout.indices <- which(folds == i, arr.ind = T)
+    folded.errors <- fold.errors(df, holdout.indices)
+    errors <- errors %>%
+      bind_rows(folded.errors)
+  }
+  errors %>%
+    summarize(train.errors.logit=mean(train.error), valid.errors.logit=mean(valid.error))
+}
+```
+
+```{r echo=FALSE}
+
+formula.tree = (label~.)
+
+set.seed(77)
+iterated.errors.tree <- tibble()
+
+for (i in  1:numiters){
+  i=i+1
+  fold.errors.tree <- tree.k.fold.validator(train.voice.tree, 5, formula.tree)
+  iterated.errors.tree <- iterated.errors.tree %>%
+    bind_rows(fold.errors.tree)
+  
+}
+
+colnames(iterated.errors.tree) <- c("train.tree","valid.tree")
+
+```
+
+#4.5 Boosted Model
+
+Next we fit the tree based Boosted Model.
+
+```{r echo=FALSE}
+# datat is already split in train and test. 
+#fit the data to bagged model
+
+voice.boost=gbm( label~ .,data=train.voice.red,distribution="gaussian", 
+                 n.trees=5000, interaction.depth=4)
+summary(voice.boost)
+```
+The summary of the Boosted model gives us the plot and a table of the relative influence of the predictors and it reinforces the observations made so far that Mean fundamental Frequency and IQR are the most influential predictors for this classification task. We now check the training error rate of the model. 
+```{r echo=FALSE}
+#Train Error 
+obs.response <- train.voice.red$label
+voice.pred = predict(voice.boost,train.voice.red,n.trees=1000)
+voice.pred = ifelse(voice.pred > 0.5, "1","0") 
+
+Con_Mat=table(voice.pred, obs.response)
+#Con_Mat
+
+FP = Con_Mat[2,1]
+TN = Con_Mat[1,1]
+FPR = FP/(FP+TN)
+
+error.train=mean(voice.pred != obs.response)*100
+error.train
+
+```
+THe Boosted model gives a training error rate near 0% . It is common for the training error estimates of the boosted model to me very low as they fit the training data very well.
+```{r echo=FALSE}
+#K-Fold Validator for Boosted Tree # Chunk used in section 4.8
+boost.k.fold.validator <- function(df, K, tol,fit.formula) {
+  
+  # this function calculates the errors of a single fold using the fold as the holdout data
+  fold.errors <- function(df, holdout.indices) {
+    train.data <- df[-holdout.indices, ]
+    holdout.data <- df[holdout.indices, ]
+    
+    fit <- gbm( fit.formula ,data=train.data,distribution="gaussian", 
+                 n.trees=1000, interaction.depth=4)
+    obs.response <- train.data$label
+    train.prob <- predict(fit, train.data,n.trees=1000)
+    voice.pred <- rep("0", nrow(train.data))
+    voice.pred[train.prob > tol] <- "1"
+    
+    train.error <- mean(obs.response != voice.pred)
+    
+    obs.holdout <- holdout.data$label
+    holdout.prob <- predict(fit, holdout.data,n.trees=1000)
+    voice.holdout <- rep("0", nrow(train.data))
+    voice.holdout[holdout.prob > tol] <- "1"
+    
+    holdout.error <- mean(obs.holdout != voice.holdout)
+    
+    tibble(train.error = train.error, valid.error = holdout.error)
+  }
+  
+  # shuffle the data and create the folds
+  indices <- sample(1:nrow(df))
+  # if argument K == 1 we want to do LOOCV
+  if (K == 1) {
+    K <- nrow(df)
+  }
+  folds <- cut(indices, breaks = K, labels = F)
+  # set error to 0 to begin accumulation of fold error rates
+  errors <- tibble()
+  # iterate on the number of folds
+  for (i in 1:K) {
+    holdout.indices <- which(folds == i, arr.ind = T)
+    folded.errors <- fold.errors(df, holdout.indices)
+    errors <- errors %>%
+      bind_rows(folded.errors)
+  }
+  errors %>%
+    summarize(train.errors.logit=mean(train.error), valid.errors.logit=mean(valid.error))
+}
+```
+
+```{r echo=FALSE}
+
+formula.boost = (label~.)
+
+set.seed(77)
+iterated.errors.boost <- tibble()
+
+for (i in  1:numiters){
+  i=i+1
+  fold.errors.boost <- boost.k.fold.validator(train.voice.red, 5, tol=tol, formula.boost)
+  iterated.errors.boost <- iterated.errors.boost %>%
+    bind_rows(fold.errors.boost)
+  
+}
+
+colnames(iterated.errors.boost) <- c("train.boost","valid.boost")
+
+```
+
+#4.6 Support Vector Machine
+Last model that we fit in this exercise is SVM. 
+```{r echo=FALSE}
+svm.fit <- svm(label ~ ., data = train.voice.red, kernel = "linear", cost = 10, scale = F)
+svm.fit$tot.nSV
+```
+The SVM fit in this case is hard to visualize due to the multi-dimensional nature of the problem. However, we can see that hyperlane used a total of 1496 support Vectors to separate the dataset. To evaluate the model we check the training error rate.
+```{r echo=FALSE}
+#Train Error 
+obs.response <- train.voice.red$label
+voice.pred = predict(svm.fit,train.voice.red)
+voice.pred = ifelse(voice.pred > 0.5, "1","0") 
+
+Con_Mat=table(voice.pred, obs.response)
+#Con_Mat
+
+FP = Con_Mat[2,1]
+TN = Con_Mat[1,1]
+FPR = FP/(FP+TN)
+
+error.train=mean(voice.pred != obs.response)*100
+error.train
+
+```
+SVM model gives a training error rate of 3.1% . We haven't tuned the cost parameter in this exercise. However, it has similar training error as the Boosted model and the Multi-predictor Logistic model. To properly evaluate the fits of all the model we now can use k-fold cross validation to check their performance with an unseen dataset.
+```{r echo=FALSE}
+#K-Fold Validator for SVM # Chunk used in section 4.8
+svm.k.fold.validator <- function(df, K, tol,fit.formula) {
+  
+  # this function calculates the errors of a single fold using the fold as the holdout data
+  fold.errors <- function(df, holdout.indices) {
+    train.data <- df[-holdout.indices, ]
+    holdout.data <- df[holdout.indices, ]
+    
+    fit <-  svm(fit.formula, data = train.data, kernel = "linear", cost = 10, scale = F)
+    obs.response <- train.data$label
+    train.prob <- predict(fit, train.data,n.trees=1000)
+    voice.pred <- rep("0", nrow(train.data))
+    voice.pred[train.prob > tol] <- "1"
+    
+    train.error <- mean(obs.response != voice.pred)
+    
+    obs.holdout <- holdout.data$label
+    holdout.prob <- predict(fit, holdout.data,n.trees=1000)
+    voice.holdout <- rep("0", nrow(train.data))
+    voice.holdout[holdout.prob > tol] <- "1"
+    
+    holdout.error <- mean(obs.holdout != voice.holdout)
+    
+    tibble(train.error = train.error, valid.error = holdout.error)
+  }
+  
+  # shuffle the data and create the folds
+  indices <- sample(1:nrow(df))
+  # if argument K == 1 we want to do LOOCV
+  if (K == 1) {
+    K <- nrow(df)
+  }
+  folds <- cut(indices, breaks = K, labels = F)
+  # set error to 0 to begin accumulation of fold error rates
+  errors <- tibble()
+  # iterate on the number of folds
+  for (i in 1:K) {
+    holdout.indices <- which(folds == i, arr.ind = T)
+    folded.errors <- fold.errors(df, holdout.indices)
+    errors <- errors %>%
+      bind_rows(folded.errors)
+  }
+  errors %>%
+    summarize(train.errors.logit=mean(train.error), valid.errors.logit=mean(valid.error))
+}
+```
+
+```{r echo=FALSE}
+
+formula.svm = (label~.)
+
+set.seed(77)
+iterated.errors.svm<- tibble()
+
+for (i in  1:numiters){
+  i=i+1
+  fold.errors.svm <- svm.k.fold.validator(train.voice.red, 5, tol=tol, formula.svm)
+  iterated.errors.svm <- iterated.errors.svm %>%
+    bind_rows(fold.errors.svm)
+  
+}
+
+colnames(iterated.errors.svm) <- c("train.svm","valid.svm")
+
+```
+
+#4.7 k-fold cross validation of the fits
+
+We can get a good evaluatation of the models by cross validation. In this case, we use iterated 5-fold cross validation  over 100 iterations to evaluate the models fitted through sections 4.2 and 4.7.
+
+```{r echo=FALSE}
+#The code chunks of validation are in the respective subsections with the models#
+#this chuck is just collating and plotting them# The error rates are in Percentages
+
+all.model.errors <- cbind(iterated.errors.baseline,iterated.errors.sf,iterated.errors.mf,iterated.errors.lda,iterated.errors.tree,iterated.errors.boost,iterated.errors.svm)
+
+valid.plot<- all.model.errors[-c(1,3,5,7,9,11,13)]
+train.plot<- all.model.errors[-c(1,3,5,7,9,11,13)]
+
+all.model.errors %>%
+  pivot_longer(train.baseline:valid.svm, names_to = "model", values_to = "error_values") %>%  
+  ggplot() + vt.theme +theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))+
+  geom_boxplot(aes( x =reorder(model, -error_values*100) ,y =error_values*100))+
+  xlab("Error Type and Model") +
+  ylab("Mean Error Rate(%)") +
+  labs(title = "5-Fold Cross-Validation(Baseline included) ")
+
+all.model.errors %>%
+  pivot_longer(train.logit.sp:valid.svm, names_to = "model", values_to = "error_values") %>%  
+  ggplot() + vt.theme +theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))+
+  geom_boxplot(aes( x =reorder(model, -error_values*100) ,y =error_values*100))+
+  xlab("Error Type and Model") +
+  ylab("Mean Error Rate(%)") +
+  labs(title = "5-Fold Cross-Validation(Feature selected models)")
+```
+
+
+The boxplots of 5-fold cross validation show us the train and validation error rates of models in decreasing order of their error. From two plots we can see the relative performance of the models. The plot with the baseline shows us that the biggest improvement, in this case near 30% drop in error rate,  is achieved from proper feature selection.  
+From these boxplot of feature selected models we can see that the while the boosted model shows nearly 0% error in training , it has validation error near 2.5%. However, this is the best model indicated so far. Mutli-predictor logistic model comes a close second with train error just over 2.5% and validation error just below 3%. 
+
+#4.9 Evaluation on test set
+
+Finally we evaluate our models on the test set to see how they perform on a fresh dataset.
+```{r echo=FALSE}
+#Recode labels as male =0 Female =1
+test.voice.nl <- test.voice %>%
+  mutate(label = recode(label, 
+                      "male" = 0, 
+                      "female" = 1))
+
+```
+
+```{r echo=FALSE}
+#Test Error baseline
+
+obs.response <- test.voice.nl$label
+voice.pred = predict(baseline.fit.voice, newdata=test.voice.nl)
+voice.pred = ifelse(voice.pred > 0.5, "1","0") 
+
+Con_Mat=table(voice.pred, obs.response)
+#Con_Mat
+
+
+FP = Con_Mat[2,1]
+TN = Con_Mat[1,1]
+FPR = FP/(FP+TN)
+
+error.test.baseline=mean(voice.pred != obs.response)*100
+
+```
+
+```{r echo=FALSE}
+#Test Error Single Predictor
+obs.response <- test.voice.nl$label
+voice.pred = predict(imp.sf.fit, newdata=test.voice.nl, type='response')
+voice.pred = ifelse(voice.pred > 0.5, "1","0") 
+
+Con_Mat=table(voice.pred, obs.response)
+#Con_Mat
+
+FP = Con_Mat[2,1]
+TN = Con_Mat[1,1]
+FPR = FP/(FP+TN)
+
+error.test.logit.sp=mean(voice.pred != obs.response)*100
+
+```
+
+```{r echo=FALSE}
+#Reduced Multiple predictors
+test.voice.red = test.voice.nl[, which(colnames(test.voice.nl) %in% colnames(train.voice.red))]
+#Test Error
+obs.response <- test.voice.nl$label
+voice.pred = predict(best.logit.fit, newdata=test.voice.red, type='response')
+voice.pred = ifelse(voice.pred > 0.5, "1","0") 
+
+Con_Mat=table(voice.pred, obs.response)
+#Con_Mat
+
+FP = Con_Mat[2,1]
+TN = Con_Mat[1,1]
+FPR = FP/(FP+TN)
+
+error.test.logit.mp=mean(voice.pred != obs.response)*100
+
+```
+
+```{r echo=FALSE}
+#Test Error lda
+tol = 0.5
+lda.prob.test <- predict(voice.lda, test.voice.red)
+lda.pred1.test <- lda.prob.test$posterior[,2]
+
+
+gend.pred.test <- rep(0, nrow(test.voice.red))
+gend.pred.test[lda.pred1.test > tol] <- 1
+obs.response = test.voice.nl$label
+
+Con_Mat=table(gend.pred.test, obs.response)
+#Con_Mat
+
+FP = Con_Mat[2,1]
+TN = Con_Mat[1,1]
+FPR = FP/(FP+TN) 
+
+error.test.lda = mean(gend.pred.test != obs.response)*100
+
+```
+
+```{r echo=FALSE}
+#Train Error Decision Tree
+test.voice.tree <- test.voice[, - which(colnames(train.voice.nl) %in% highly.Cor.Col)]
+obs.response <- test.voice.tree$label
+voice.pred = predict(voice.tree,test.voice.tree,type="class")
+
+Con_Mat=table(voice.pred, obs.response)
+#Con_Mat
+
+FP = Con_Mat[2,1]
+TN = Con_Mat[1,1]
+FPR = FP/(FP+TN)
+
+error.test.tree=mean(voice.pred != obs.response)*100
+
+```
+
+```{r echo=FALSE}
+#Test Error Boost
+obs.response <- test.voice.red$label
+voice.pred = predict(voice.boost,test.voice.red, n.trees=1000)
+voice.pred = ifelse(voice.pred > 0.5, "1","0") 
+
+Con_Mat=table(voice.pred, obs.response)
+#Con_Mat
+
+FP = Con_Mat[2,1]
+TN = Con_Mat[1,1]
+FPR = FP/(FP+TN)
+
+error.test.boost=mean(voice.pred != obs.response)*100
+
+```
+
+```{r echo=FALSE}
+#Test Error SVM
+obs.response <- test.voice.red$label
+voice.pred = predict(svm.fit,test.voice.red)
+voice.pred = ifelse(voice.pred > 0.5, "1","0") 
+
+Con_Mat=table(voice.pred, obs.response)
+#Con_Mat
+
+FP = Con_Mat[2,1]
+TN = Con_Mat[1,1]
+FPR = FP/(FP+TN)
+
+error.test.svm=mean(voice.pred != obs.response)*100
+```
+
+```{r echo=FALSE}
+#Collate all test errors
+
+test.errors <-bind_cols(Baseline=error.test.baseline,Logit.sp=error.test.logit.sp,
+                                        Tree=error.test.tree,SVM=error.test.svm, LDA=error.test.lda,
+                                        Logit.mp=error.test.logit.mp,Boosted=error.test.boost)
+test.errors
+```
+The overall test error rates also achieve the biggest step forward from feature selection. The error rates and model performances on Test set are concurrent with the observations from validation errors. Boosted Model stands as the best model for the task with a Test Error of 2.3%.
+
+#5. Conclusion
+
+From this exercise showed that the Boosted Tree model is the best for the task of Classification of Gender from Vocal Frequency. The model showed a train error of nearly 0% , validation error below 2.5% and a Test Error of 2.3%. While these may not exactly reflect real world accuracies. We can be fairly confident in the model. 
+
+We also answered the questions about Gender vs Frequency characteristics that we set out to explore. Firstly, The most Frequency characteristics are marginally different between genders. However, Mean fundamental Frequency is the most distinct feature of the voice between genders.By definition, resonance is a quality which is directly related to the Fundamental Frequency, it is therefore, clearly a a feature distinct to gender.Another important feature is the Inter-quantile range(IQR). While the other features differ between voices and genders they aren't as distinct.
+
+While the exercise explains most of questions, it poses a few that are beyond the scope of the dataset.For instance, can we characterize falsetto as male/female accurately?. This is a question for a dataset of falsetto samples. The good news is that it is fairly easy to create our own voice samples and effectively analyze them with effective use of the techniques used in this exercise.
+
+##Apendix
+##A
+1)meanfreq: mean frequency (in kHz)
+2)sd: standard deviation of frequency
+3)median: median frequency (in kHz)
+4)Q25: first quantile (in kHz)
+5)Q75: third quantile (in kHz)
+6)IQR: interquantile range (in kHz)
+7)skew: skewness of frequency distribution
+8)kurt: kurtosis of frequency distribution
+9)sp.ent: spectral entropy
+10)sfm: spectral flatness
+11)mode: mode frequency
+12)centroid: frequency centroid 
+13)meanfun: average of fundamental frequency measured across acoustic signal
+14)minfun: minimum fundamental frequency measured across acoustic signal
+15)maxfun: maximum fundamental frequency measured across acoustic signal
+16)meandom: average of dominant frequency measured across acoustic signal
+17)mindom: minimum of dominant frequency measured across acoustic signal
+18)maxdom: maximum of dominant frequency measured across acoustic signal
+19)dfrange: range of dominant frequency measured across acoustic signal
+20)modindx: modulation index. Calculated as the accumulated absolute difference between adjacent measurements of fundamental frequencies divided by the frequency range
+21)label: male or female 
+##B
+Audio samples used in dataset can be downloaded here:http://festvox.org/cmu_arctic/
+
